@@ -544,6 +544,7 @@ Tras el paso 3, el actuador pasa a `on` en la web.
 | Síntoma | Causa |
 |---|---|
 | El comando se queda en `pendiente` | Node-RED no consulta, o su API Key no tiene `comandos:enviar` |
+| `{"exito":false,"mensaje":"Demasiadas solicitudes…"}` | **Rate limit.** Ya no afecta a `/iot/*`; si lo ves, actualiza la API (ver nota abajo) |
 | `{"campo":"mediciones.0.valor","mensaje":"Invalid input"}` | Falta `valor`, o es `NaN` (no es JSON válido) |
 | `procesadas: N, fallidas: M` con M > 0 | Algún `canal` no existe en la base de datos |
 | El comando pasa a `enviado` pero nunca a `ejecutado` | El ESP32 no recibe MQTT, o no puede confirmar |
@@ -551,6 +552,30 @@ Tras el paso 3, el actuador pasa a `on` en la web.
 | El dispositivo aparece `offline` | No llega el heartbeat de estado (watchdog de 5 min) |
 | `HTTP 401` | Falta el header `X-API-Key` o el permiso no está activo |
 | El ESP32 no conecta a la API | `localhost` apunta al propio ESP32: usa la IP del PC |
+
+### Sobre el error «Demasiadas solicitudes»
+
+Si Node-RED recibe `{"exito":false,"mensaje":"Demasiadas solicitudes. Intente de
+nuevo más tarde."}`, es el **rate limit** de la API.
+
+Por qué pasaba: el límite general es de **100 peticiones / 15 min por IP**,
+pensado para el navegador. Node-RED consultando cada 2 s hace **450**, así que
+se bloqueaba a los pocos minutos.
+
+**Las rutas `/iot/*` están excluidas del rate limit** en `src/app.ts`. Es
+seguro porque ya exigen API Key y son tráfico máquina-a-máquina; el límite se
+mantiene en login y registro, que es donde protege de verdad.
+
+Si ves ese error en `/iot/*`, tu copia de la API es anterior a esa corrección:
+haz `git pull` y reinicia.
+
+```js
+// src/app.ts — la exclusión
+skip: (req) => req.path.startsWith(`${VERSION}/iot/`),
+```
+
+Alternativa si no puedes actualizar: sube `RATE_LIMIT_MAX` en el `.env` (pero
+debilita la protección del login).
 
 ### Comprobar el ciclo de vida de un comando
 
