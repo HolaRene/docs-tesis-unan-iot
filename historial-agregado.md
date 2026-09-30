@@ -81,6 +81,7 @@ PostgreSQL (GROUP BY date_trunc)  →  API  →  Frontend (Recharts)
 | `dia` | `day` | 30 / 90 días |
 | `semana` | `week` | Tendencias largas |
 | `mes` | `month` | Año completo |
+| `sin_agrupar` | *(ninguno)* | Depurar y muestreo rápido |
 
 **Seguridad:** el intervalo **se valida contra una lista blanca** antes de
 entrar al SQL. Nunca se interpola un valor libre en la consulta:
@@ -92,6 +93,58 @@ const trunc = TRUNCS[intervalo]; // valor resuelto en el servidor
 
 Probado con un intento de inyección (`intervalo=hora');DROP TABLE...`) →
 rechazado por el schema con error de validación, tabla intacta.
+
+## `sin_agrupar`: cuando la agrupación oculta los datos
+
+Este intervalo devuelve **una fila por medición**, sin promediar.
+
+### El problema que resuelve
+
+Si un equipo envía cada 2 segundos y el cubo es de 1 minuto, **30 mediciones se
+funden en un solo punto**. En el gráfico se ve un dato suelto rodeado de
+huecos, y parece que el sensor se desconectó cuando en realidad llegaron todos
+los datos.
+
+Es un problema real de diagnóstico: cuesta distinguir «no llega nada» de
+«llega mucho y se agrupa».
+
+### Comparación
+
+Los mismos datos (6 mediciones con valor `30.5`, cada 2 segundos):
+
+| Modo | Puntos devueltos | Mediciones |
+|---|---|---|
+| `minuto` | **1** | 6 |
+| `sin_agrupar` | **6** | 6 |
+
+### Cómo se comporta
+
+- Cada punto lleva `muestras: 1` y `minimo = maximo = media`.
+- `desviacion` es `NULL`: no tiene sentido la desviación de un solo valor.
+- **No se rellena la malla temporal**: el hueco entre dos puntos es el periodo
+  de muestreo (2 s), no una falta de datos.
+- La forma de la respuesta es idéntica a la agrupada, así que el frontend no
+  necesita un camino distinto.
+
+### Cuándo usarlo
+
+- Para depurar: «envié 50 datos y solo veo un punto».
+- Con equipos que muestrean más rápido que 1 vez por minuto.
+
+> ⚠️ **No lo uses para rangos largos.** Al no agrupar, un mes de datos cada 2 s
+> son más de un millón de filas. Acota con `desde`/`hasta` o con `limite`
+> (máximo 2000 puntos).
+
+### Aviso en la interfaz
+
+Los gráficos muestran **cuántas mediciones hay detrás de los puntos**:
+
+```
+150 mediciones agrupadas en 3 puntos
+```
+
+Así se ve de un vistazo si el gráfico está promediando o si de verdad faltan
+datos.
 
 ## La media es ponderada (detalle importante)
 
