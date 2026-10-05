@@ -97,7 +97,8 @@ POST /api/v1/cameras
 
 | Componente | Responsabilidad |
 |---|---|
-| `camara-player.tsx` | **WebRTC puro**. Negocia WHEP; carga/error/sin-stream/reconectar. **No conoce la API.** |
+| `camara-player.tsx` | **WebRTC puro**. Negocia WHEP; carga/error/sin-stream/reconectar; pantalla completa. **No conoce la API.** |
+| `preview-camara.tsx` | Preview en la tarjeta: conecta solo al pasar el ratón |
 | `estado-camara.tsx` | Badge de estado |
 | `camara-card.tsx` | Tarjeta del listado, con acciones opcionales |
 | `camara-grid.tsx` | Grilla con estados vacío/cargando/error |
@@ -154,6 +155,62 @@ formulario la sugiere automáticamente a partir del nombre y el canal
 
 `useCamaras()` · `useCamara(id)` · `useCrearCamara()` ·
 `useActualizarCamara()` · `useActualizarEstadoCamara()` · `useEliminarCamara()`
+
+## Preview en las tarjetas
+
+La tarjeta del listado muestra el vídeo **solo cuando el ratón entra en ella**;
+al salir, se desconecta.
+
+### Por qué no reproduce siempre
+
+Cada reproductor abre su **propia conexión WebRTC** contra MediaMTX. Con 8
+cámaras en pantalla serían 8 conexiones simultáneas consumiendo ancho de banda,
+CPU y recursos del servidor de vídeo… aunque nadie esté mirando.
+
+| Estrategia | Conexiones con 8 cámaras |
+|---|---|
+| Reproducir siempre | **8** simultáneas |
+| Reproducir al pasar el ratón | Las que estés mirando (normalmente 1-2) |
+
+### Detalles de implementación
+
+- El hueco en reposo tiene el **mismo `aspect-video`** que el reproductor. Si no,
+  la grilla daría un salto de altura al pasar el ratón.
+- Se usa `onFocus`/`onBlur` además de `onMouseEnter`/`onMouseLeave`, para que
+  funcione navegando con el teclado.
+- La `key` del reproductor es la `ruta_webrtc`: si la tarjeta cambia de cámara,
+  se remonta y **cierra la conexión anterior** en vez de reutilizarla.
+- Sin `ruta_webrtc` no se conecta nunca: se muestra el hueco con un aviso.
+
+> En pantallas táctiles no existe el «hover». El preview se activa al tocar.
+
+## Pantalla completa
+
+El reproductor del detalle tiene un **botón de pantalla completa** que aparece
+cuando el vídeo está en marcha.
+
+### Se pide sobre el contenedor, no sobre el `<video>`
+
+```ts
+await contenedorRef.current.requestFullscreen();
+```
+
+No es un capricho: **Safari de iOS no permite pantalla completa en un `<video>`
+que recibe un `MediaStream`** (solo en vídeos con archivo). Pidiéndola sobre el
+contenedor funciona en todos los navegadores, y además se siguen viendo los
+controles y la etiqueta «En directo».
+
+### El estado se sincroniza con el evento
+
+```ts
+document.addEventListener("fullscreenchange", alCambiar);
+```
+
+No basta con alternar un booleano: el usuario puede salir con **Esc** o con el
+gesto del sistema, y entonces el botón mostraría el icono equivocado.
+
+Si el navegador rechaza la petición (por ejemplo dentro de un iframe sin
+`allowfullscreen`), se avisa y el vídeo sigue viéndose en su tamaño normal.
 
 ## Configuración de vídeo
 
