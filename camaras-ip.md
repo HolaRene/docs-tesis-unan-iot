@@ -99,11 +99,56 @@ POST /api/v1/cameras
 |---|---|
 | `camara-player.tsx` | **WebRTC puro**. Negocia WHEP; carga/error/sin-stream/reconectar. **No conoce la API.** |
 | `estado-camara.tsx` | Badge de estado |
-| `camara-card.tsx` | Tarjeta del listado |
+| `camara-card.tsx` | Tarjeta del listado, con acciones opcionales |
 | `camara-grid.tsx` | Grilla con estados vacío/cargando/error |
-| `gestion-camaras.tsx` | Listado (TanStack Query) |
+| `gestion-camaras.tsx` | Listado + alta, edición y borrado (TanStack Query) |
+| `formulario-camara.tsx` | Formulario de alta/edición con asistente de canal |
 | `detalle-camara.tsx` | Detalle y composición |
 | `camara-detalles.tsx` | Ficha técnica |
+
+## Cámaras multi-canal
+
+Una cámara con varios canales (una **HikVision de 2**, un NVR de 8) expone
+**cada canal en una ruta RTSP distinta**. En la plataforma se registra como
+**una cámara por canal**:
+
+```
+Quirófano 1 - Canal 1  →  /Streaming/Channels/101   →  /quirofano-1-canal-1
+Quirófano 1 - Canal 2  →  /Streaming/Channels/201   →  /quirofano-1-canal-2
+```
+
+Misma IP, mismo puerto, **distinta ruta**. No hace falta nada especial en la
+base de datos: el modelo ya lo soporta.
+
+### El asistente de rutas
+
+El formulario incluye un catálogo por fabricante
+(`src/configuracion/camaras.ts`) que rellena la ruta al elegir marca y canal:
+
+| Fabricante | Canales | Ruta del canal 1 | Ruta del canal 2 |
+|---|---|---|---|
+| HikVision | 4 | `/Streaming/Channels/101` | `/Streaming/Channels/201` |
+| Dahua | 4 | `/cam/realmonitor?channel=1&subtype=0` | `/cam/realmonitor?channel=2&subtype=0` |
+| Axis | 2 | `/axis-media/media.amp?streamprofile=1` | `/axis-media/media.amp?streamprofile=2` |
+| Reolink | 2 | `/h264Preview_01_main` | `/h264Preview_02_main` |
+| Genérica | 1 | *(manual)* | — |
+
+**Numeración de HikVision**: `<canal>01` es el stream **principal** y `<canal>02`
+el **secundario** (menos resolución y ancho de banda):
+
+```
+Canal 1 principal → 101      Canal 1 secundario → 102
+Canal 2 principal → 201      Canal 2 secundario → 202
+```
+
+### Rutas WebRTC únicas
+
+La `ruta_webrtc` es el identificador del stream en MediaMTX y **debe ser
+única**: si se repite, la API rechaza el alta con un mensaje claro. El
+formulario la sugiere automáticamente a partir del nombre y el canal
+(minúsculas, sin acentos, con guiones).
+
+## Frontend
 
 ### Hooks (`src/hooks/useCamaras.ts`)
 
