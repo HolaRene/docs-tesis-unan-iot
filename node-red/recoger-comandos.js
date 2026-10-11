@@ -1,182 +1,191 @@
 /**
- * Node-RED — RECOGIDA Y ENTREGA DE COMANDOS A ACTUADORES
- * ======================================================
- *
- * Este nodo function cierra el circuito de los actuadores. Se ejecuta con un
- * `inject` periódico (cada 2-3 s) y hace tres cosas:
- *
- *   1. Pregunta a la API si hay comandos PENDIENTES.
- *   2. Publica cada uno en su tema MQTT (para el ESP32/PLC).
- *   3. Confirma la entrega a la API ('enviado').
+ * Node-RED — COMANDOS DE ACTUADORES POR MQTT (sin `fetch`)
+ * ========================================================
  *
  * ────────────────────────────────────────────────────────────────────
- * POR QUÉ POLLING Y NO WEBSOCKET
+ * POR QUÉ NO SE USA `fetch` NI `http` DE NODE
  * ────────────────────────────────────────────────────────────────────
- * El WebSocket de la plataforma sirve para EMPUJAR datos hacia el navegador
- * (mediciones, alertas). Para Node-RED, preguntar cada 2 s es más robusto:
- * sobrevive a reinicios y a cortes de red sin lógica de reconexión.
+ * El nodo `function` de Node-RED se ejecuta dentro de un sandbox, y no
+ * siempre expone `fetch`:
+ *
+ *   - Con el sandbox por defecto (`vm`), `fetch` NO existe.
+ *   - `await` en el nivel superior solo funciona en versiones recientes.
+ *   - Si el sandbox está en modo `none`, sí hay `fetch`, pero depender de
+ *     eso hace que el flujo funcione en unos equipos y en otros no.
+ *
+ * La forma correcta y portable en Node-RED es el nodo **`http request`**.
+ * El código solo PREPARA el mensaje; el nodo hace la llamada.
  *
  * ────────────────────────────────────────────────────────────────────
- * CÓMO MONTARLO EN NODE-RED
+ * ESTRUCTURA DEL FLUJO
  * ────────────────────────────────────────────────────────────────────
  *
- *   [inject 2s] ──► [function: este código] ──► [json] ──► [debug]
- *
- * El nodo `function` usa `node.send` DOS VECES por salida:
- *   - La salida del mensaje MQTT (para el nodo `mqtt out`).
- *   - Un mensaje HTTP (para confirmar la entrega).
- *
- * Se configuran DOS salidas en el nodo function:
- *   salida 1 → nodo `mqtt out`      (publica la orden)
- *   salida 2 → nodo `http request`  (confirma a la API)
+ *   [inject 2s]
+ *        │
+ *   [function: preparar-pendientes]   ← pone msg.url y msg.method
+ *        │
+ *   [http request]                    ← hace el GET a la API
+ *        │
+ *   [function: repartir]              ← un mensaje por comando
+ *        │
+ *     [split]
+ *        │
+ *   [mqtt out]                        ← publica cada orden
+ *        │
+ *   [function: preparar-confirmar]    ← pone msg.url del PATCH
+ *        │
+ *   [http request]                    ← confirma la entrega
+ *        │
+ *      [debug]
  *
  * ────────────────────────────────────────────────────────────────────
- * SI NO QUIERES USAR MQTT
+ * POR QUÉ "ENTREGAR Y CONFIRMAR" VAN ENCADENADOS
  * ────────────────────────────────────────────────────────────────────
- * La salida 1 se puede conectar a lo que prefieras: un `http request` al PLC,
- * un `modbus write`, un `tcp out`… El payload ya viene listo.
+ * El `mqtt out` no espera confirmación del broker: al publicar, el mensaje
+ * sigue por la cadena. Así se confirma la entrega inmediatamente después de
+ * publicar, sin bloquear el flujo.
+ *
+ * ⚠️ Si Node-RED se cayera entre publicar y confirmar, el comando seguiría
+ * `pendiente` y se reintentaría. Es preferible duplicar una entrega
+ * (idempotente para un relé) que perderla en silencio.
  */
 
 // ─────────────────────────────────────────────────────────────
-// CONFIGURACIÓN
+// CONFIGURACIÓN COMÚN
 // ─────────────────────────────────────────────────────────────
-
-/** URL base de la API. */
 const API = "http://localhost:4000/api/v1";
+const API_KEY = env.get("NODE_RED_API_KEY") || "flx_CAMBIAR_ESTA_CLAVE";
 
-/** API Key con permiso `comandos:enviar`. */
-// Se lee de la variable de entorno de Node-RED (settings.js).
-const API_KEY =
-  env.get("NODE_RED_API_KEY") || "flx_CAMBIAR_ESTA_CLAVE";
-
-/**
- * Prefijo de los temas MQTT.
- *
- * Cada actuador se publica en SU propio tema, para que un ESP32 solo reciba
- * las órdenes que le corresponden:
- *
- *     hospital/quirofano/cmd/RELE-1
- *     hospital/quirofano/cmd/RELE-2
- *
- * Si el actuador tiene `topico_mqtt` configurado en la base de datos, se usa
- * ese tal cual; si no, se construye con este prefijo + el código.
- */
-const PREFIJO_TEMA = "hospital/quirofano/cmd";
-
-/** Sinónimos de comando aceptados, normalizados a ON/OFF. */
+/** Sinónimos aceptados, normalizados a booleano. */
 const COMANDOS_ON = ["ON", "1", "TRUE", "ENCENDER", "ABRIR"];
 const COMANDOS_OFF = ["OFF", "0", "FALSE", "APAGAR", "CERRAR"];
 
-/** Normaliza el comando a un valor booleano comprensible por el equipo. */
-function normalizar(comando) {
-  const c = String(comando || "").trim().toUpperCase();
-  if (COMANDOS_ON.includes(c)) return { valor: true, texto: "ON" };
-  if (COMANDOS_OFF.includes(c)) return { valor: false, texto: "OFF" };
-  // Comando desconocido: se envía tal cual, sin interpretarlo.
-  return { valor: null, texto: c };
-}
+/** Prefijo si el actuador no trae `topico_mqtt` en la base de datos. */
+const PREFIJO_TEMA = "hospital/quirofano/cmd";
 
-// ─────────────────────────────────────────────────────────────
-// 1) PEDIR LOS COMANDOS PENDIENTES
-// ─────────────────────────────────────────────────────────────
-const respuesta = await fetch(API + "/iot/comandos/pendientes?limite=50", {
-  method: "GET",
-  headers: {
-    "X-API-Key": API_KEY,
-    "Content-Type": "application/json",
-  },
-});
+// =============================================================
+// NODO 1 · PREPARAR LA PETICIÓN DE PENDIENTES
+// =============================================================
+// Este es el código del PRIMER nodo function. Solo prepara el mensaje:
+// no llama a nadie.
 
-if (!respuesta.ok) {
-  const texto = await respuesta.text();
-  node.warn(
-    `[comandos] La API respondió ${respuesta.status}. ¿API Key correcta? ${texto.slice(0, 120)}`
-  );
+msg.url = `${API}/iot/comandos/pendientes?limite=50`;
+msg.method = "GET";
+msg.headers = {
+  "X-API-Key": API_KEY,
+  "Content-Type": "application/json",
+};
+
+// Se guarda para saber, al volver, que esta respuesta es de "pendientes".
+msg.contexto = "pendientes";
+
+node.status({ fill: "blue", shape: "ring", text: "consultando" });
+return msg;
+
+
+// =============================================================
+// NODO 2 · INTERPRETAR Y REPARTIR (va DESPUÉS del http request)
+// =============================================================
+/*
+
+  ⬇️  COPIA ESTE BLOQUE EN UN SEGUNDO NODO `function`  ⬇️
+
+*/
+
+/*
+// ¿La petición falló?
+if (msg.statusCode < 200 || msg.statusCode >= 300) {
+  node.warn(`[comandos] La API respondio ${msg.statusCode}`);
+  if (msg.statusCode === 401) {
+    node.warn("[comandos] API Key incorrecta o sin permiso comandos:enviar");
+  }
+  node.status({ fill: "red", shape: "ring", text: `HTTP ${msg.statusCode}` });
   return null;
 }
 
-const cuerpo = await respuesta.json();
-const pendientes = cuerpo?.datos ?? [];
+// `msg.payload` ya viene como OBJETO si el nodo tiene "Parse JSON" activado.
+// Si viene como texto, se parsea aquí para no depender de esa opción.
+let cuerpo = msg.payload;
+if (typeof cuerpo === "string") {
+  try {
+    cuerpo = JSON.parse(cuerpo);
+  } catch (e) {
+    node.warn("[comandos] La respuesta no es JSON valido");
+    return null;
+  }
+}
 
-// Sin comandos: no se emite nada (evita ensuciar el debug cada 2 segundos).
+const pendientes = (cuerpo && cuerpo.datos) ? cuerpo.datos : [];
+
 if (pendientes.length === 0) {
   node.status({ fill: "grey", shape: "ring", text: "sin comandos" });
-  return null;
+  return null;   // sin comandos: no se emite nada
 }
 
-node.status({
-  fill: "green",
-  shape: "dot",
-  text: `${pendientes.length} comando(s)`,
-});
-
-// ─────────────────────────────────────────────────────────────
-// 2) PUBLICAR EN MQTT  +  3) CONFIRMAR A LA API
-// ─────────────────────────────────────────────────────────────
-const paraMqtt = [];
-const paraConfirmar = [];
+const salidas = [];
 
 for (const cmd of pendientes) {
-  const { valor, texto } = normalizar(cmd.comando);
+  const tema = cmd.actuador_topico_mqtt || (PREFIJO_TEMA + "/" + cmd.actuador_codigo);
 
-  // Tema del actuador: el suyo propio si lo tiene, si no se deriva del código.
-  const tema =
-    cmd.actuador_topico_mqtt || `${PREFIJO_TEMA}/${cmd.actuador_codigo}`;
+  const c = String(cmd.comando || "").trim().toUpperCase();
+  const encender = COMANDOS_ON.includes(c);
 
-  paraMqtt.push({
+  salidas.push({
+    // El nodo `mqtt out` lee el tema de aquí: NO se configura un tema fijo.
     topic: tema,
     qos: 1,
     retain: false,
     payload: {
-      // Identificación: permite al equipo comprobar que la orden es suya.
       actuador: cmd.actuador_codigo,
       dispositivo: cmd.dispositivo_identificador,
-      comando: texto,
-      valor,
-      // El id permite al equipo ACK-ear la ejecución más tarde.
-      comando_id: cmd.id,
+      comando: encender ? "ON" : "OFF",
+      valor: encender,
+      comando_id: cmd.id,          // permite confirmar despues
       enviado_en: new Date().toISOString(),
-      // Datos extra que pudiera haber añadido la web.
-      parametros: cmd.valor ?? null,
+      parametros: cmd.valor || null,
     },
   });
-
-  paraConfirmar.push(cmd.id);
 }
 
-// Salida 1: un mensaje por comando → nodo `mqtt out`.
-node.send([paraMqtt, null]);
+node.status({ fill: "green", shape: "dot", text: salidas.length + " comando(s)" });
 
-// Salida 2: confirmar la entrega a la API.
-//
-// Se hace DESPUÉS de publicar en MQTT. Si Node-RED se cayera entre ambas
-// cosas, el comando seguiría 'pendiente' y se reintentaría: es preferible
-// duplicar una entrega (idempotente para un relé) que perderla en silencio.
-const confirmaciones = [];
-for (const id of paraConfirmar) {
-  const r = await fetch(API + "/iot/comandos/" + id, {
-    method: "PATCH",
-    headers: {
-      "X-API-Key": API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      estado: "enviado",
-      respuesta: { origen: "node-red", via: "mqtt" },
-    }),
-  });
+// Se devuelve un ARRAY: el nodo `split` los separa en mensajes sueltos.
+return [salidas];
 
-  confirmaciones.push({
-    id,
-    ok: r.ok,
-    status: r.status,
-  });
+*/
 
-  if (!r.ok) {
-    node.warn(`[comandos] No se pudo confirmar ${id}: HTTP ${r.status}`);
-  }
+
+// =============================================================
+// NODO 3 · PREPARAR LA CONFIRMACIÓN DE ENTREGA
+// =============================================================
+/*
+
+  ⬇️  COPIA ESTE BLOQUE EN UN TERCER NODO `function`  ⬇️
+  (va DESPUÉS del `mqtt out`, sobre el mismo mensaje)
+
+*/
+
+/*
+// El `comando_id` viaja dentro del payload publicado; se recupera aquí.
+const id = msg.payload && msg.payload.comando_id;
+
+if (!id) {
+  // Sin id no hay nada que confirmar: probablemente el mensaje no venía
+  // de este flujo.
+  return null;
 }
 
-node.send([null, confirmaciones]);
+msg.url = `${API}/iot/comandos/${id}`;
+msg.method = "PATCH";
+msg.headers = {
+  "X-API-Key": API_KEY,
+  "Content-Type": "application/json",
+};
+msg.payload = {
+  estado: "enviado",
+  respuesta: { origen: "node-red", via: "mqtt" },
+};
 
-return null;
+return msg;
+
+*/

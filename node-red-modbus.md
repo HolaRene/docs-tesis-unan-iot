@@ -62,16 +62,30 @@ FROM comandos_actuador ORDER BY creado_en DESC LIMIT 5;
 ```
    [inject 2s]                                  ← dispara el ciclo
         │
-   [function: pedir pendientes]                 ← GET a la API
+   [function: preparar-pendientes]              ← pone msg.url y msg.method
+        │
+   [http request]                               ← GET a la API
+        │
+   [function: repartir]                         ← un mensaje por comando
         │
      [split]                                    ← 1 mensaje por comando
         │
    [modbus write]                               ← escribe en el PLC
         │
-   [function: confirmar]                        ← PATCH a la API
+   [function: preparar-confirmar]               ← pone msg.url del PATCH
+        │
+   [http request]                               ← PATCH a la API
         │
      [debug]
 ```
+
+> ⚠️ **No uses `fetch` dentro del nodo `function`.** El sandbox de Node-RED
+> (`vm`) no lo expone en muchas versiones, y `await` en el nivel superior solo
+> funciona en las recientes. Si tu flujo falla con `fetch is not defined` o
+> `await is only valid in async functions`, ese es el motivo.
+>
+> La forma portable es el nodo **`http request`**: el código solo prepara
+> `msg.url`, `msg.method` y `msg.headers`.
 
 ### Por qué hace falta `split`
 
@@ -89,17 +103,34 @@ Sin `split`, Modbus recibe un array y falla (o escribe solo el primero).
 | Repeat | interval |
 | Every | `2` seconds |
 
-**2. `function` (el código está en `docs/node-red/comandos-modbus.js`)**
+**2. `function: preparar-pendientes`**
 
-Un solo nodo hace las dos fases: recoger y confirmar. Se distinguen porque en
-la fase de confirmación el mensaje trae `msg.comando_actual`.
+Solo prepara la petición. Es el **primer bloque** de
+`docs/node-red/comandos-modbus.js`.
 
-**3. `split`**
+**3. `http request`**
+
+| Campo | Valor |
+|---|---|
+| Method | **desde `msg.method`** (marcar la casilla) |
+| URL | **desde `msg.url`** (marcar la casilla) |
+| Headers | **desde `msg.headers`** (marcar la casilla) |
+| Return | a parsed JSON object |
+
+> Marcar las tres casillas "desde el mensaje" es lo que permite reutilizar el
+> mismo nodo para el GET y para el PATCH, y que las URLs no queden fijas.
+
+**4. `function: repartir`**
+
+Es el **segundo bloque** del archivo. Interpreta la respuesta y arma un
+mensaje por comando.
+
+**5. `split`**
 
 - Por defecto (`msg.payload`). El array de comandos se convierte en mensajes
   sueltos.
 
-**4. `modbus write`**
+**6. `modbus write`**
 
 | Campo | Valor |
 |---|---|
@@ -107,6 +138,16 @@ la fase de confirmación el mensaje trae `msg.comando_actual`.
 | FC | `FC 5: Force Single Coil` (para encender/apagar) |
 | Address | **desde `msg.topic`** (marcar la casilla) |
 | Value | **desde `msg.payload`** (marcar la casilla) |
+
+**7. `function: preparar-confirmar`**
+
+Es el **tercer bloque** del archivo. Detecta el error de Modbus (comprobando
+**tres** señales distintas) y prepara el `PATCH`.
+
+**8. `http request`**
+
+El mismo nodo que el paso 3. Como la URL, el método y las cabeceras vienen del
+mensaje, sirve para ambas llamadas.
 
 > La dirección y el valor los pone el nodo `function`, así que se marcan las
 > casillas "desde el mensaje". Así el mismo nodo sirve para todos los

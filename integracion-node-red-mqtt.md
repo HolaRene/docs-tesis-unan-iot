@@ -245,8 +245,8 @@ el estado real del actuador (`on`/`off`), que es lo que muestra la web.
 **Flujo 2 — Comandos (vuelta)**
 
 ```
-[inject 2s] ─► [function] ─┬─► [mqtt out]   (salida 1: publica la orden)
-                           └─► [debug]      (salida 2: confirmaciones)
+[inject 2s] ─► [function: preparar] ─► [http request] ─► [function: repartir]
+   ─► [split] ─► [mqtt out] ─► [function: confirmar] ─► [http request] ─► [debug]
 ```
 
 **Flujo 3 — Estado (ida)**
@@ -293,21 +293,50 @@ return msg;
 
 ### 3.2 Flujo 2: comandos (el importante)
 
-El código completo está en **`docs/node-red/recoger-comandos.js`**.
+El código completo está en **`docs/node-red/recoger-comandos.js`**, separado en
+**tres bloques** para tres nodos `function`.
 
-**Estructura del nodo `function`:** se configuran **dos salidas**.
+> ⚠️ **Este flujo NO usa `fetch`.** El sandbox del nodo `function` (`vm`) no
+> lo expone en muchas versiones de Node-RED, y `await` en el nivel superior
+> solo funciona en las recientes. Si ves `fetch is not defined`, ese es el
+> motivo.
+>
+> La forma portable es el nodo **`http request`**: el código solo prepara
+> `msg.url`, `msg.method` y `msg.headers`.
+
+**Estructura:**
 
 ```
-                 ┌─ salida 1 ──► [mqtt out]   publica la orden
-[function] ──────┤
-                 └─ salida 2 ──► [debug]      confirmaciones
+[inject 2s]
+   ─► [function: preparar-pendientes]   ← pone msg.url (GET)
+   ─► [http request]                    ← llama a la API
+   ─► [function: repartir]              ← un mensaje por comando
+   ─► [split]
+   ─► [mqtt out]                        ← publica cada orden
+   ─► [function: preparar-confirmar]    ← pone msg.url (PATCH)
+   ─► [http request]                    ← confirma la entrega
+   ─► [debug]
 ```
 
 **Qué hace, en orden:**
 
-1. `GET /iot/comandos/pendientes` con la API Key.
-2. Por cada comando, construye el mensaje MQTT y lo emite por la salida 1.
-3. Confirma cada uno con `PATCH /iot/comandos/{id}` → estado `enviado`.
+1. Prepara y hace `GET /iot/comandos/pendientes`.
+2. Interpreta la respuesta y arma un mensaje MQTT por comando.
+3. Publica cada orden en su tema.
+4. Prepara y hace `PATCH /iot/comandos/{id}` → estado `enviado`.
+
+**Nodo `http request`** (se usa dos veces, el mismo):
+
+| Campo | Valor |
+|---|---|
+| Method | **desde `msg.method`** (marcar la casilla) |
+| URL | **desde `msg.url`** (marcar la casilla) |
+| Headers | **desde `msg.headers`** (marcar la casilla) |
+| Return | a parsed JSON object |
+
+> Marcar las tres casillas "desde el mensaje" es lo que permite reutilizar el
+> mismo nodo para el GET y el PATCH. Si se fijaran a mano, harían falta dos
+> nodos distintos.
 
 **Nodo `mqtt out`:**
 

@@ -1,60 +1,56 @@
 /**
- * Node-RED — COMANDOS A PLC POR MODBUS, CON CONFIRMACIÓN
- * ======================================================
+ * Node-RED — COMANDOS A PLC POR MODBUS, CON CONFIRMACIÓN (sin `fetch`)
+ * ====================================================================
  *
  * Cierra el circuito: recoge los comandos pendientes, los escribe en el PLC
  * por Modbus y **confirma a la API si funcionó o no**.
  *
  * ────────────────────────────────────────────────────────────────────
- * EL PROBLEMA QUE RESUELVE
+ * POR QUÉ NO SE USA `fetch`
  * ────────────────────────────────────────────────────────────────────
- * Sin confirmar, la API no sabe nada: el comando se queda en `pendiente`
- * para siempre. Y como sigue pendiente, el `inject` lo vuelve a enviar en la
- * siguiente vuelta. Resultado:
+ * El nodo `function` corre en un sandbox que NO siempre expone `fetch`. Con
+ * el sandbox por defecto (`vm`) no existe, y `await` en el nivel superior
+ * solo funciona en versiones recientes.
  *
- *   - No sabes si el PLC encendió.
- *   - El comando se escribe en el PLC una y otra vez.
- *   - La web muestra "pendiente" eternamente.
- *
- * Confirmar es lo que convierte esto en un circuito cerrado.
+ * La forma portable es el nodo **`http request`**. El código solo prepara
+ * `msg.url`, `msg.method` y `msg.headers`.
  *
  * ────────────────────────────────────────────────────────────────────
- * ESTRUCTURA EN NODE-RED
+ * ESTRUCTURA DEL FLUJO
  * ────────────────────────────────────────────────────────────────────
  *
  *   [inject 2s]
  *        │
- *   [function: pedir pendientes]      ← hace el GET, arma la lista
+ *   [function: preparar-pendientes]   ← GET /iot/comandos/pendientes
  *        │
- *   [split]                           ← un mensaje por comando
+ *   [http request]
  *        │
- *   [modbus write]                    ← escribe en el PLC
+ *   [function: repartir]              ← un mensaje por comando
  *        │
- *   [function: confirmar]             ← interpreta el resultado y hace PATCH
+ *     [split]
  *        │
- *   [debug]
+ *  [modbus write]                      ← escribe en el PLC
+ *        │
+ *   [function: preparar-confirmar]     ← PATCH con el resultado
+ *        │
+ *   [http request]
+ *        │
+ *      [debug]
  *
  * ────────────────────────────────────────────────────────────────────
- * CÓMO SE INTERPRETA EL RESULTADO DE MODBUS
+ * EL PROBLEMA QUE RESUELVE CONFIRMAR
  * ────────────────────────────────────────────────────────────────────
- * El nodo `modbus write` NO lanza error si el PLC responde con una excepción:
- * devuelve el error en `msg.payload` (con `payload.errorCode` y
- * `payload.errorMessage`) o deja el mensaje tal cual si todo fue bien.
+ * Sin confirmar, el comando se queda en `pendiente` para siempre y el
+ * `inject` lo vuelve a escribir en el PLC en cada ciclo, indefinidamente.
+ * Confirmar es lo que CIERRA el circuito y detiene el reenvío.
  *
- * Hay que mirar esas señales explícitamente. Si no, se confirma "ejecutado"
- * aunque el PLC haya rechazado la escritura.
- *
- * ────────────────────────────────────────────────────────────────────
- * OJO: QUÉ SE PUEDE AFIRMAR Y QUÉ NO
- * ────────────────────────────────────────────────────────────────────
- * Que el `modbus write` no dé error significa que el PLC ACEPTÓ la escritura,
- * no necesariamente que la salida física cambió. Para saber eso de verdad hay
- * que LEER el registro/coil y comprobar el valor. En la sección 3 del
- * documento se explica cómo hacerlo con un `modbus read` después.
+ * ⚠️ Que el `modbus write` no dé error significa que el PLC ACEPTÓ la
+ * escritura, no que la salida física cambió. Para saberlo hay que LEER de
+ * vuelta (ver `docs/node-red-modbus.md`, sección 3).
  */
 
 // ─────────────────────────────────────────────────────────────
-// CONFIGURACIÓN
+// CONFIGURACIÓN COMÚN
 // ─────────────────────────────────────────────────────────────
 const API = "http://localhost:4000/api/v1";
 const API_KEY = env.get("NODE_RED_API_KEY") || "flx_CAMBIAR_ESTA_CLAVE";
@@ -65,101 +61,60 @@ const REGISTRO_POR_DEFECTO = 0;
 /**
  * Mapa de direcciones Modbus por código de actuador.
  *
- * Se usa SOLO como respaldo: lo ideal es que cada actuador traiga su dirección
- * en `configuracion.modbus` desde la base de datos. Así, añadir un actuador no
- * obliga a editar Node-RED.
- *
- *   configuracion: { "modbus": { "direccion": 100, "tipo": "coil" } }
+ * Respaldo local: lo ideal es que cada actuador traiga su dirección en
+ * `configuracion.modbus` desde la base de datos, para no editar Node-RED al
+ * añadir un actuador.
  */
 const DIRECCIONES = {
   "LED-1": { direccion: 0, tipo: "coil" },
   "RELE-1": { direccion: 1, tipo: "coil" },
 };
 
-// ─────────────────────────────────────────────────────────────
-// ¿En qué fase está este mensaje?
-// ─────────────────────────────────────────────────────────────
-//
-// El mismo nodo se usa para DOS tareas distintas:
-//   1. Recoger los pendientes (no trae `msg.comando_actual`).
-//   2. Confirmar el resultado (sí lo trae, porque viene del modbus write).
-//
-// Distinguirlas es lo que permite tener un solo nodo en lugar de dos.
+// =============================================================
+// NODO 1 · PREPARAR LA PETICIÓN DE PENDIENTES
+// =============================================================
 
-if (msg.comando_actual) {
-  // ─────────── FASE 2: CONFIRMAR EL RESULTADO ───────────
-  const cmd = msg.comando_actual;
-  const p = msg.payload || {};
+msg.url = `${API}/iot/comandos/pendientes?limite=50`;
+msg.method = "GET";
+msg.headers = {
+  "X-API-Key": API_KEY,
+  "Content-Type": "application/json",
+};
 
-  /*
-   * Detección de error de Modbus.
-   *
-   * El nodo devuelve el fallo de tres formas posibles según la versión:
-   *   - `payload.errorCode` + `payload.errorMessage` (excepción Modbus)
-   *   - `payload.error` (error de transporte)
-   *   - `msg.error` (fallo del propio nodo)
-   *
-   * Se comprueban las tres: quedarse con una sola haría que algunos fallos
-   * pasaran por éxitos.
-   */
-  const errorCode = p.errorCode ?? p.error;
-  const errorMensaje = p.errorMessage ?? msg.error?.message;
-  const huboError = Boolean(errorCode || errorMensaje);
+node.status({ fill: "blue", shape: "ring", text: "consultando" });
+return msg;
 
-  const estado = huboError ? "fallido" : "ejecutado";
 
-  msg.headers = {
-    "X-API-Key": API_KEY,
-    "Content-Type": "application/json",
-  };
-  msg.url = `${API}/iot/comandos/${cmd.id}`;
-  msg.method = "PATCH";
-  msg.payload = {
-    estado,
-    /*
-     * `estado_actuador` hace que la web muestre el estado REAL del equipo.
-     * Solo se envía si la escritura fue bien: si falló, no sabemos en qué
-     * estado quedó la salida y es mejor no inventarlo.
-     */
-    ...(huboError ? {} : { estado_actuador: cmd.valor_on ? "on" : "off" }),
-    respuesta: {
-      origen: "node-red",
-      via: "modbus",
-      direccion: cmd.direccion,
-      valor_escrito: cmd.valor_on ? 1 : 0,
-      ...(huboError ? { error: String(errorMensaje ?? errorCode) } : { ok: true }),
-    },
-  };
+// =============================================================
+// NODO 2 · INTERPRETAR Y REPARTIR (tras el http request)
+// =============================================================
+/*
 
-  node.status({
-    fill: huboError ? "red" : "green",
-    shape: "dot",
-    text: `${cmd.actuador_codigo} ${huboError ? "FALLO" : "OK"}`,
-  });
+  ⬇️  COPIA ESTE BLOQUE EN UN SEGUNDO NODO `function`  ⬇️
 
-  if (huboError) {
-    node.warn(
-      `[modbus] ${cmd.actuador_codigo} fallo al escribir en ${cmd.direccion}: ${errorMensaje}`
-    );
+*/
+
+/*
+if (msg.statusCode < 200 || msg.statusCode >= 300) {
+  node.warn(`[comandos] La API respondio ${msg.statusCode}`);
+  if (msg.statusCode === 401) {
+    node.warn("[comandos] API Key incorrecta o sin permiso comandos:enviar");
   }
-
-  return msg;
-}
-
-// ─────────── FASE 1: PEDIR LOS PENDIENTES ───────────
-
-const respuesta = await fetch(`${API}/iot/comandos/pendientes?limite=50`, {
-  method: "GET",
-  headers: { "X-API-Key": API_KEY, "Content-Type": "application/json" },
-});
-
-if (!respuesta.ok) {
-  node.warn(`[comandos] La API respondio ${respuesta.status}`);
+  node.status({ fill: "red", shape: "ring", text: `HTTP ${msg.statusCode}` });
   return null;
 }
 
-const cuerpo = await respuesta.json();
-const pendientes = cuerpo?.datos ?? [];
+let cuerpo = msg.payload;
+if (typeof cuerpo === "string") {
+  try {
+    cuerpo = JSON.parse(cuerpo);
+  } catch (e) {
+    node.warn("[comandos] La respuesta no es JSON valido");
+    return null;
+  }
+}
+
+const pendientes = (cuerpo && cuerpo.datos) ? cuerpo.datos : [];
 
 if (pendientes.length === 0) {
   node.status({ fill: "grey", shape: "ring", text: "sin comandos" });
@@ -169,34 +124,101 @@ if (pendientes.length === 0) {
 const salidas = [];
 
 for (const cmd of pendientes) {
-  // Dirección Modbus: primero la del actuador, luego el mapa local.
   const cfg = DIRECCIONES[cmd.actuador_codigo] || {};
-  const direccion = cfg.direccion ?? REGISTRO_POR_DEFECTO;
-  const tipo = cfg.tipo ?? "coil";
+  const direccion = (cfg.direccion !== undefined) ? cfg.direccion : REGISTRO_POR_DEFECTO;
+  const tipo = cfg.tipo || "coil";
 
-  // Normalizar el comando a 0/1 (lo que entiende Modbus).
   const c = String(cmd.comando || "").trim().toUpperCase();
   const encender = ["ON", "1", "TRUE", "ENCENDER", "ABRIR"].includes(c);
 
   salidas.push({
-    payload: encender ? 1 : 0,
-    // El nodo `modbus write` lee de aquí la dirección y el tipo.
+    // El nodo `modbus write` lee de aqui la direccion y el tipo.
     topic: tipo,
-    // Contexto que viaja hasta la fase de confirmación.
+    payload: encender ? 1 : 0,
+    // Contexto que viaja hasta la fase de confirmacion.
     comando_actual: {
       id: cmd.id,
       actuador_codigo: cmd.actuador_codigo,
-      direccion,
+      direccion: direccion,
       valor_on: encender,
     },
   });
 }
 
+node.status({ fill: "blue", shape: "dot", text: salidas.length + " comando(s)" });
+
+return [salidas];
+
+*/
+
+
+// =============================================================
+// NODO 3 · PREPARAR LA CONFIRMACIÓN (tras el modbus write)
+// =============================================================
+/*
+
+  ⬇️  COPIA ESTE BLOQUE EN UN TERCER NODO `function`  ⬇️
+
+*/
+
+/*
+const cmd = msg.comando_actual;
+
+if (!cmd) {
+  // Sin contexto no se sabe que comando era: no se confirma nada.
+  return null;
+}
+
+const p = msg.payload || {};
+
+// ── Detección del error de Modbus ──────────────────────────────
+//
+// El nodo `modbus write` NO lanza excepcion: devuelve el error dentro del
+// payload. Se comprueban TRES senales distintas, porque con una sola
+// algunos fallos pasarian por exitos.
+const errorCode = p.errorCode !== undefined ? p.errorCode : p.error;
+const errorMensaje = p.errorMessage !== undefined
+  ? p.errorMessage
+  : (msg.error ? msg.error.message : null);
+const huboError = Boolean(errorCode || errorMensaje);
+
+const estado = huboError ? "fallido" : "ejecutado";
+
+msg.url = `${API}/iot/comandos/${cmd.id}`;
+msg.method = "PATCH";
+msg.headers = {
+  "X-API-Key": API_KEY,
+  "Content-Type": "application/json",
+};
+msg.payload = {
+  estado: estado,
+  // `estado_actuador` hace que la web muestre el estado REAL del equipo.
+  // Solo se envia si la escritura fue bien: si fallo, no sabemos en que
+  // estado quedo la salida y es mejor no inventarlo.
+  estado_actuador: huboError ? undefined : (cmd.valor_on ? "on" : "off"),
+  respuesta: {
+    origen: "node-red",
+    via: "modbus",
+    direccion: cmd.direccion,
+    valor_escrito: cmd.valor_on ? 1 : 0,
+    error: huboError ? String(errorMensaje || errorCode) : undefined,
+    ok: !huboError,
+  },
+};
+
+// Se limpia el contexto para que no viaje al siguiente nodo.
+delete msg.comando_actual;
+
 node.status({
-  fill: "blue",
+  fill: huboError ? "red" : "green",
   shape: "dot",
-  text: `${salidas.length} comando(s)`,
+  text: cmd.actuador_codigo + (huboError ? " FALLO" : " OK"),
 });
 
-// `node.send` acepta un array: el `split` los separará en mensajes sueltos.
-return [salidas];
+if (huboError) {
+  node.warn(`[modbus] ${cmd.actuador_codigo} fallo en ${cmd.direccion}: ${errorMensaje}`);
+}
+
+return msg;
+
+*/
