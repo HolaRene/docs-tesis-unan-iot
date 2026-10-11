@@ -196,6 +196,28 @@ siguen mostrando como lista de lecturas.
 
 ## Frontend
 
+### Mini-gráfico del detalle de sensor: 30 minutos
+
+En `/sensores/[id]`, cada magnitud muestra un mini-gráfico **al inicio de su
+tarjeta**, antes del valor actual y del contador de mediciones.
+
+| | Antes | Ahora |
+|---|---|---|
+| Ventana | 60 minutos | **30 minutos** |
+| Puntos aproximados | 60 | 30 |
+| Posición | Al final de la tarjeta | **Al principio** |
+
+**Por qué 30 minutos**: en un gráfico pequeño, 60 puntos quedan apiñados y el
+trazo pierde legibilidad. Con 30 se ve mejor la tendencia reciente, que es lo
+que se consulta de un vistazo en el listado de magnitudes.
+
+**Por qué primero**: la forma de la serie dice más que un número suelto. Al
+poner el gráfico arriba, se comparan varias magnitudes de un vistazo sin tener
+que bajar por la tarjeta.
+
+> El mini-gráfico del **dashboard** sigue usando una hora: allí las tarjetas
+> son más grandes y el contexto amplio aporta más.
+
 ### Componentes (`src/components/graficos/`)
 
 | Componente | Responsabilidad |

@@ -239,7 +239,7 @@ marcadores `$n` del SQL y los comparan con los parámetros enviados.
 |---|---|
 | `GET /dashboard/resumen` | Métricas y listas |
 | `GET /canales` | Valor actual de cada magnitud |
-| `GET /sensors/:id/series?intervalo=minuto&canal_id=…` | Mini-gráfico de la última hora |
+| `GET /sensors/:id/series?intervalo=minuto&canal_id=…` | Mini-gráfico de la última hora (en el dashboard) |
 
 > `/canales` devuelve un **array directo** en `datos`, no un objeto con clave
 > `canales`. Confundirlo hace que el panel salga vacío **sin dar error**.
