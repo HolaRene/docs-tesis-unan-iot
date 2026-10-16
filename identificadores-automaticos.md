@@ -13,6 +13,7 @@ las usa el hardware para identificarse:
 | `identificador` | `dispositivos` | El equipo, al enviar datos: `{"dispositivo": "ESP32-Q2"}` |
 | `codigo` | `sensores` | Base del código de sus canales |
 | `codigo` | `canales` | El equipo, en cada medición: `{"canal": "DHT1W-TEMPERATURA"}` |
+| `codigo` | `actuadores` | **Tema MQTT**: `hospital/quirofano/cmd/BUZZER-QUIROFANO` |
 
 Si se escriben a mano desde el frontend aparecen tres problemas:
 
@@ -60,6 +61,30 @@ SENSOR-QUIROFANO-1-3    ← tercero
 
 El **primer intento no lleva sufijo**, así el caso normal produce el
 identificador limpio.
+
+### Caso particular: actuadores (tipo + nombre)
+
+El código del actuador se forma con el **tipo delante**:
+
+```
+"Quirófano"        + buzzer       →  BUZZER-QUIROFANO
+"Buzzer Quirófano" + buzzer       →  BUZZER-QUIROFANO   (no repite)
+"LED 1"            + digital_out  →  DIGITAL-OUT-LED-1
+"Válvula A"        + valvula      →  VALVULA-A
+"Relé 1"           + (sin tipo)   →  RELE-1
+```
+
+**Por qué el tipo va primero**: el código forma parte del tema MQTT al que
+Node-RED publica las órdenes. Que empiece por el tipo hace el tema
+autoexplicativo: al ver `cmd/BUZZER-QUIROFANO` se sabe qué se está accionando
+sin consultar la base de datos.
+
+**Los guiones bajos se normalizan** (`digital_out` → `DIGITAL-OUT`), porque en
+un tema MQTT quedan mejor como guiones.
+
+Además, el formulario muestra una **previsualización en vivo** del código,
+reproduciendo la misma regla. Se comprobó con 7 casos que la previsualización
+coincide exactamente con lo que genera el backend.
 
 ## Generación en cascada
 
