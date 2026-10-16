@@ -55,20 +55,44 @@
 const API = "http://localhost:4000/api/v1";
 const API_KEY = env.get("NODE_RED_API_KEY") || "flx_CAMBIAR_ESTA_CLAVE";
 
-/** Dirección Modbus por defecto si el actuador no la trae. */
-const REGISTRO_POR_DEFECTO = 0;
+/*
+ * Ya NO hay dirección por defecto a propósito.
+ *
+ * Antes existía `REGISTRO_POR_DEFECTO = 0`: si el actuador no traía
+ * dirección, se escribía en la 0 en silencio. Eso accionaba OTRA salida del
+ * PLC, y el síntoma («pulso el extractor y se enciende la luz») es de los
+ * que cuesta horas encontrar.
+ *
+ * Ahora, si falta la dirección, el comando se salta y se avisa.
+ */
 
 /**
- * Mapa de direcciones Modbus por código de actuador.
+ * ¿Hace falta un mapa de direcciones aquí?
  *
- * Respaldo local: lo ideal es que cada actuador traiga su dirección en
- * `configuracion.modbus` desde la base de datos, para no editar Node-RED al
- * añadir un actuador.
+ * NO. Y esa es la mejora importante: la dirección ya NO se configura en
+ * Node-RED, viene en el propio comando desde la API.
+ *
+ * Antes había que mantener este mapa a mano:
+ *
+ *     const DIRECCIONES = {
+ *       "LED-1":    { direccion: 0, tipo: "coil" },
+ *       "RELE-1":   { direccion: 1, tipo: "coil" },
+ *     };
+ *
+ * Eso obligaba a editar Node-RED cada vez que se añadía un actuador, y las
+ * direcciones (que son el CABLEADO de la instalación) acababan duplicadas en
+ * dos sitios que podían desincronizarse.
+ *
+ * Ahora la API envía:
+ *
+ *     direccionamiento: {
+ *       protocolo: "modbus", tipo: "coil", direccion: 100, unidad_id: 1,
+ *       valor_on: 1, valor_off: 0
+ *     }
+ *
+ * Node-RED solo lo reenvía al nodo `modbus write`. Añadir un actuador nuevo
+ * no requiere tocar este flujo.
  */
-const DIRECCIONES = {
-  "LED-1": { direccion: 0, tipo: "coil" },
-  "RELE-1": { direccion: 1, tipo: "coil" },
-};
 
 // =============================================================
 // NODO 1 · PREPARAR LA PETICIÓN DE PENDIENTES
@@ -124,22 +148,56 @@ if (pendientes.length === 0) {
 const salidas = [];
 
 for (const cmd of pendientes) {
-  const cfg = DIRECCIONES[cmd.actuador_codigo] || {};
-  const direccion = (cfg.direccion !== undefined) ? cfg.direccion : REGISTRO_POR_DEFECTO;
-  const tipo = cfg.tipo || "coil";
+  /*
+   * La dirección viene DEL COMANDO, no de un mapa local.
+   *
+   * Es la diferencia clave: añadir un actuador nuevo ya no obliga a editar
+   * este flujo. La API la calcula desde la configuración del actuador.
+   */
+  const dir = cmd.direccionamiento || {};
+
+  const direccion = dir.direccion;
+  const tipo = dir.tipo || "coil";
+  const unidad = dir.unidad_id !== undefined ? dir.unidad_id : 1;
+
+  /*
+   * Si el comando NO trae dirección, no se puede accionar nada.
+   *
+   * Se avisa y se SALTA el comando en lugar de escribir en la dirección 0,
+   * que es una salida real del PLC y accionaría OTRO equipo. Ese fallo sería
+   * muy difícil de diagnosticar: «pulso el extractor y se enciende la luz».
+   */
+  if (direccion === undefined || direccion === null) {
+    node.warn(
+      `[modbus] ${cmd.actuador_codigo} no tiene dirección configurada. ` +
+      `Configúrala en la web (Actuadores → editar → protocolo Modbus).`
+    );
+    continue;
+  }
 
   const c = String(cmd.comando || "").trim().toUpperCase();
   const encender = ["ON", "1", "TRUE", "ENCENDER", "ABRIR"].includes(c);
 
+  /*
+   * El valor sale del comando, no de un 1/0 fijo: un relé invertido se
+   * activa escribiendo 0.
+   */
+  const valor = encender
+    ? (dir.valor_on !== undefined ? dir.valor_on : 1)
+    : (dir.valor_off !== undefined ? dir.valor_off : 0);
+
   salidas.push({
     // El nodo `modbus write` lee de aqui la direccion y el tipo.
     topic: tipo,
-    payload: encender ? 1 : 0,
+    payload: valor,
+    // La unidad Modbus distingue varios PLC en la misma red.
+    unidad_id: unidad,
     // Contexto que viaja hasta la fase de confirmacion.
     comando_actual: {
       id: cmd.id,
       actuador_codigo: cmd.actuador_codigo,
       direccion: direccion,
+      unidad_id: unidad,
       valor_on: encender,
     },
   });

@@ -82,16 +82,32 @@ unsigned long ultimoIntentoWifi = 0;
 unsigned long ultimoIntentoMqtt = 0;
 
 // ─────────────────────────────────────────────────────────────
-// RELÉ
+// SALIDA
 // ─────────────────────────────────────────────────────────────
-void aplicarRele(bool encender) {
-  releEncendido = encender;
+/**
+ * Aplica un valor a un pin concreto.
+ *
+ * Antes esta función era `aplicarRele(bool)` y escribía siempre en
+ * `PIN_RELE`, con la lógica del nivel activo cableada en el código (LOW para
+ * encender). Eso tenía dos problemas:
+ *
+ *   1. Cambiar de pin obligaba a recompilar y flashear.
+ *   2. Si el relé no era invertido, había que editar el firmware.
+ *
+ * Ahora el pin y el valor llegan calculados desde la plataforma, así que el
+ * mismo firmware sirve para cualquier salida.
+ *
+ * @param pin    Pin físico a escribir.
+ * @param valor  0 o 1, ya ajustado al nivel activo configurado en la web.
+ */
+void aplicarSalida(int pin, int valor) {
+  releEncendido = (valor != 0);
 
-  // La mayoría de módulos de relé se activan con nivel BAJO (LOW).
-  // Si el tuyo funciona al revés, intercambia HIGH y LOW aquí.
-  digitalWrite(PIN_RELE, encender ? LOW : HIGH);
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, valor == 0 ? LOW : HIGH);
 
-  Serial.printf("[RELE] %s\n", encender ? "ENCENDIDO" : "APAGADO");
+  Serial.printf("[SALIDA] pin %d -> %d (%s)\n",
+                pin, valor, releEncendido ? "ACTIVO" : "INACTIVO");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -163,10 +179,35 @@ void alRecibirComando(char* tema, byte* carga, unsigned int longitud) {
 
   Serial.printf("[MQTT] Comando '%s' (id=%s)\n", comando, id);
 
-  // El campo `valor` es booleano y ya viene normalizado por Node-RED.
-  bool encender = doc["valor"] | false;
+  /*
+   * ────────────────────────────────────────────────────────────────
+   * DIRECCIONAMIENTO: el pin ya no está fijo en el firmware
+   * ────────────────────────────────────────────────────────────────
+   * Antes este sketch tenía `PIN_RELE` como constante, así que cambiar el
+   * pin obligaba a recompilar y flashear. Ahora el pin y el nivel activo
+   * llegan en el comando, configurados desde la web:
+   *
+   *   "direccionamiento": {
+   *     "protocolo": "gpio", "pin": 2, "nivel_activo": 0,
+   *     "valor_on": 0, "valor_off": 1
+   *   }
+   *
+   * El ESP32 sigue siendo libre de ignorarlo y usar su pin por defecto si el
+   * comando no lo trae, para no romper instalaciones ya desplegadas.
+   */
+  JsonObject dir = doc["direccionamiento"];
 
-  aplicarRele(encender);
+  int pin = dir["pin"] | PIN_RELE;
+  int nivelActivo = dir["nivel_activo"] | 1;
+
+  // El valor CONCRETO a escribir lo calcula la API según el nivel activo:
+  // un relé invertido se activa escribiendo 0.
+  int valor = doc["valor"] | 0;
+
+  Serial.printf("[MQTT] Direccionamiento: pin=%d nivel_activo=%d valor=%d\n",
+                pin, nivelActivo, valor);
+
+  aplicarSalida(pin, valor);
 
   // Confirmar a la API que se ejecutó.
   confirmarEjecucion(String(id), true);
@@ -212,7 +253,7 @@ void setup() {
 
   pinMode(PIN_RELE, OUTPUT);
   // Arrancar con el relé apagado evita accionar algo sin querer al reiniciar.
-  aplicarRele(false);
+  aplicarSalida(PIN_RELE, 0);
 
   conectarWifi();
 

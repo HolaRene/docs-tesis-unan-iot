@@ -125,10 +125,36 @@ if (pendientes.length === 0) {
 const salidas = [];
 
 for (const cmd of pendientes) {
-  const tema = cmd.actuador_topico_mqtt || (PREFIJO_TEMA + "/" + cmd.actuador_codigo);
+  /*
+   * El DIRECCIONAMIENTO viene ya resuelto desde la API.
+   *
+   * Antes solo llegaba el código del actuador («LED-1») y el equipo no sabía
+   * dónde accionar: un PLC no entiende nombres, entiende direcciones.
+   * Ahora llega:
+   *
+   *   { protocolo: 'modbus', tipo: 'coil', direccion: 100, unidad_id: 1,
+   *     valor_on: 1, valor_off: 0 }
+   */
+  const dir = cmd.direccionamiento || {};
+
+  const tema =
+    dir.topico ||
+    cmd.actuador_topico_mqtt ||
+    (PREFIJO_TEMA + "/" + cmd.actuador_codigo);
 
   const c = String(cmd.comando || "").trim().toUpperCase();
   const encender = COMANDOS_ON.includes(c);
+
+  /*
+   * Valor CONCRETO a escribir.
+   *
+   * No siempre es 1: un relé invertido se activa con 0. Por eso se usa el
+   * `valor_on`/`valor_off` que calculó la API según el nivel activo
+   * configurado, en lugar de asumir 1 y 0.
+   */
+  const valor = encender
+    ? (dir.valor_on !== undefined ? dir.valor_on : true)
+    : (dir.valor_off !== undefined ? dir.valor_off : false);
 
   salidas.push({
     // El nodo `mqtt out` lee el tema de aquí: NO se configura un tema fijo.
@@ -139,7 +165,26 @@ for (const cmd of pendientes) {
       actuador: cmd.actuador_codigo,
       dispositivo: cmd.dispositivo_identificador,
       comando: encender ? "ON" : "OFF",
-      valor: encender,
+      valor: valor,
+
+      /*
+       * DIRECCIONAMIENTO: lo que permite al receptor saber DÓNDE escribir.
+       * Se envía el bloque completo para que sirva a cualquier protocolo.
+       */
+      direccionamiento: {
+        protocolo: dir.protocolo || "mqtt",
+        // Modbus
+        tipo: dir.tipo,
+        direccion: dir.direccion,
+        unidad_id: dir.unidad_id,
+        // GPIO
+        pin: dir.pin,
+        nivel_activo: dir.nivel_activo,
+        // HTTP
+        url: dir.url,
+        metodo: dir.metodo,
+      },
+
       comando_id: cmd.id,          // permite confirmar despues
       enviado_en: new Date().toISOString(),
       parametros: cmd.valor || null,
