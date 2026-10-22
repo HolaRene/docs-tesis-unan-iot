@@ -14,7 +14,7 @@ programa o archivo por lotes ejecutable.
 [ELIFECYCLE] Command failed with exit code 1.
 ```
 
-**Ya está resuelto.** El script `scripts/migrate.sh` usaba `bash` y el binario
+**Ya está resuelto.** El antiguo script `scripts/migrate.sh` usaba `bash` y el binario
 `psql`, que en Windows no vienen en el PATH. Se reescribió en TypeScript
 (`scripts/migrate.ts`) usando el driver `pg` que el proyecto ya incluye.
 
