@@ -102,11 +102,16 @@ WHERE table_name='actuadores' AND column_name IN ('topico_mqtt','ultima_orden_en
 
 ### Paso 5 · Aplicar lo que falte de verdad
 
-Si el paso 4 muestra que falta la **0015**, se aplica sola:
+Si el paso 4 muestra que faltan columnas, **no hace falta `psql`**:
 
 ```bash
-psql "$DATABASE_URL" -f src/database/migrations/0015_comandos_actuador.sql
+pnpm migrate:forzar
 ```
+
+Re-ejecuta todas las migraciones salvo las destructivas (0009 y 0010 quedan
+excluidas siempre). Como son idempotentes, repetirlas no hace daño, y esto
+repara una base a la que le faltan columnas aunque el registro diga lo
+contrario.
 
 Es segura: solo hace `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` y crea un
 índice. **No borra nada.**
@@ -128,8 +133,10 @@ Solo se ejecutará la nueva. Las antiguas quedan registradas y no se tocan.
 ## 5. Si algo sale mal
 
 ```bash
-psql "$DATABASE_URL" -f respaldos/monitoreo_iot_tesis_FECHA.sql
+node scripts/restaurar.mjs respaldos/monitoreo_iot_tesis_FECHA.sql
 ```
+
+No requiere `psql`: usa el mismo driver que la API.
 
 > Restaurar **sobrescribe** la base con el contenido del respaldo. Todo lo
 > creado después se pierde.
@@ -186,11 +193,90 @@ Son idénticos a Linux/macOS: se ejecutan con `node`, nada de `bash`.
 ### Restaurar un respaldo en Windows
 
 ```powershell
-# Con psql (ruta completa si no está en el PATH)
-& "C:\Program Files\PostgreSQL\17\bin\psql.exe" $env:DATABASE_URL -f "respaldos\monitoreo_iot_tesis_FECHA.sql"
+node scripts/restaurar.mjs respaldos\monitoreo_iot_tesis_FECHA.sql
 ```
 
-O desde **pgAdmin** → clic derecho → *Restore*.
+**No necesitas `psql` en el PATH.** Todos los comandos usan el driver `pg`,
+que ya viene instalado con la API.
+
+
+## 8. Si el baseline se aplicó en la base equivocada
+
+### Qué síntoma tiene
+
+La salida del script dice:
+
+```
+Base de datos: postgresql://postgres:***@localhost:5432/postgres
+                                                        ^^^^^^^^
+```
+
+**`postgres` es la base administrativa**, no la del proyecto. El nombre
+correcto aparece en `api/.env`, normalmente `monitoreo_iot_tesis`.
+
+### Por qué es grave
+
+El baseline **marca las 19 migraciones como aplicadas sin ejecutarlas**. Si se
+hace en una base vacía, esa base queda con el registro, y la **base real del
+proyecto sigue sin registrar nada**. El resultado es que nunca se aplican las
+migraciones nuevas, y nadie se entera.
+
+### Cómo arreglarlo en Windows
+
+**Paso 1 · Comprobar a qué base apunta**
+
+```powershell
+cd api
+Get-Content .env | Select-String "DATABASE_URL"
+```
+
+Si no aparece, crea `api\.env` con la línea correcta:
+
+```ini
+DATABASE_URL=postgresql://postgres:TU_CLAVE@localhost:5432/monitoreo_iot_tesis
+```
+
+> El script también lee `.env.development`. Si ese archivo apunta a un sitio,
+> `.env` a otro y no coinciden, ejecuta siempre desde `api/` para que se lea
+> el correcto.
+
+**Paso 2 · Deshacer el baseline en la base equivocada**
+
+```powershell
+node scripts/desmarcar.mjs --base postgres
+```
+
+No borra datos del proyecto: esa tabla solo contenía el registro falso.
+
+**Paso 3 · Verificar que es la base correcta**
+
+```powershell
+pnpm esquema
+```
+
+Si sale un número, es la base buena.
+
+**Paso 4 · Repetir el baseline en la correcta**
+
+```powershell
+pnpm migrate:dry        # debe decir "Tablas del proyecto encontradas: 5 de 5"
+pnpm migrate:baseline
+```
+
+### Salvaguarda a partir de ahora
+
+El script **aborta** si la base indicada no contiene ninguna de estas tablas:
+
+```
+areas, dispositivos, mediciones, usuarios, tipos_variable
+```
+
+```
+⛔ ABORTADO: esta base no parece la del proyecto.
+   No contiene ninguna de estas tablas: areas, dispositivos, ...
+```
+
+En ese caso no marca nada y no ejecuta nada.
 
 ## Archivos
 
