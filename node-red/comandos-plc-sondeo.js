@@ -76,8 +76,38 @@
 const API = env.get("API_URL") || "http://localhost:4000/api/v1";
 const API_KEY = env.get("API_KEY") || "";
 const INTERVALO_SONDEO_MS = 300;
+/** Espera antes de la lectura tardía de reconciliación. */
+const ESPERA_RECONCILIACION_MS = 10_000;
+
 /** Timeout por defecto si la API no responde con la configuración. */
 const TIMEOUT_POR_DEFECTO_S = 10;
+
+/**
+ * ──────────────────────────────────────────────────────────────────────
+ * NORMALIZAR EL VALOR LEÍDO
+ * ──────────────────────────────────────────────────────────────────────
+ * El nodo `modbus read` de una bobina NO devuelve `1`: devuelve un arreglo
+ * de booleanos, `[true]`.
+ *
+ * Comparar `String([true])` («true») con `String(1)` («1») nunca coincide,
+ * así que TODOS los comandos acababan en timeout aunque el PLC sí hubiera
+ * cambiado. Hay que normalizar antes de comparar.
+ */
+function normalizarLeido(crudo) {
+  // Algunas configuraciones devuelven el arreglo dentro de `payload`.
+  let v = crudo;
+  if (Array.isArray(v)) v = v[0];
+  if (v && typeof v === "object" && !(v instanceof Boolean)) {
+    // Objetos tipo { value: 1 } o { datos: [true] }
+    if (v.value !== undefined) v = Array.isArray(v.value) ? v.value[0] : v.value;
+    else if (Array.isArray(v.datos)) v = v.datos[0];
+  }
+
+  // Cualquier representación de «encendido» vale.
+  if (v === true || v === 1 || v === "1" || v === "true" || v === "TRUE") return 1;
+  if (v === false || v === 0 || v === "0" || v === "false" || v === "FALSE") return 0;
+  return v;
+}
 
 /**
  * Cache de configuración de actuadores.
@@ -269,7 +299,9 @@ if (!actual.inicio_ms) {
 }
 
 // ¿Se alcanzó el valor esperado?
-const leido = msg.payload;
+// Se normaliza: `modbus read` devuelve `[true]` para una bobina, y
+// `String([true])` nunca es igual a `String(1)`.
+const leido = normalizarLeido(msg.payload);
 const coincide = String(leido) === String(actual.valor_esperado);
 
 if (coincide) {
@@ -314,7 +346,7 @@ return [msg, null];             // salida 1 → volver a `modbus read`
    ══════════════════════════════════════════════════════════════════ */
 
 const c = msg.comando_actual;
-const valorLeido = msg.payload;
+const valorLeido = normalizarLeido(msg.payload);
 const transcurrido = c.inicio_ms ? Date.now() - c.inicio_ms : null;
 
 /*
@@ -381,6 +413,102 @@ node.status({
   text:
     `${c.actuador_codigo}: ${exito ? "ejecutado" : "timeout"}` +
     (exito && c.error_escritura ? " (con aviso)" : ""),
+});
+
+return msg;
+
+
+/* ══════════════════════════════════════════════════════════════════
+   BLOQUE 5 · LECTURA EXTRA TARDÍA (reconciliación)
+   ══════════════════════════════════════════════════════════════════
+
+   ── POR QUÉ EXISTE ──
+
+   El bloque 4 confirma el comando cuando la lectura coincide dentro del
+   timeout. Si el equipo tarda MÁS (un extractor que se mueve despacio),
+   el comando queda `fallido` aunque la orden sí se aplicó.
+
+   Existe un endpoint para corregirlo:
+
+       POST /iot/actuadores/:codigo/estado
+
+   …pero NADIE lo llamaba. La reconciliación estaba escrita y no se
+   ejecutaba nunca. Este bloque es el que la activa.
+
+   ── CUÁNDO SE EJECUTA ──
+
+   Solo si el comando terminó en TIMEOUT. Si ya se confirmó, no hace
+   falta. Se espera `ESPERA_RECONCILIACION_MS` y se lee una vez más.
+
+   Si en esa lectura el actuador está en el estado pedido, se avisa a la
+   API y ella pasa el comando a `ejecutado` con
+   `confirmado_por = "estado_reportado"`.
+
+   ══════════════════════════════════════════════════════════════════ */
+
+const c5 = msg.comando_actual;
+
+// Solo tiene sentido si el comando quedó sin confirmar.
+if (!c5 || String(normalizarLeido(msg.payload)) === String(c5.valor_esperado)) {
+  return null;
+}
+
+// Esperar antes de la lectura extra: si el equipo cambia justo después del
+// timeout, es ahora cuando se verá.
+await new Promise((r) => setTimeout(r, ESPERA_RECONCILIACION_MS));
+
+msg.direccion = c5.direccion;
+msg.unidad_id = c5.unidad_id;
+msg.reconciliacion = true; // marca para el bloque 6
+
+node.status({
+  fill: "yellow",
+  shape: "ring",
+  text: `${c5.actuador_codigo}: lectura tardía`,
+});
+
+// Salida 1 → `modbus read` y vuelve al bloque 6.
+return [msg, null];
+
+
+/* ══════════════════════════════════════════════════════════════════
+   BLOQUE 6 · AVISAR A LA API DEL ESTADO REAL
+   ══════════════════════════════════════════════════════════════════
+
+   Va DESPUÉS de la lectura tardía del bloque 5.
+
+   Informa a la API del estado que tiene el actuador AHORA. La API decide:
+   si coincide con un comando reciente `fallido` o `enviado` (últimos 2
+   minutos), lo pasa a `ejecutado` conservando el error original.
+
+   No se envía nada si el actuador no está en el estado que se pedía:
+   avisar de un estado distinto solo generaría ruido.
+
+   ══════════════════════════════════════════════════════════════════ */
+
+const c6 = msg.comando_actual;
+const leido6 = normalizarLeido(msg.payload);
+
+if (!c6 || String(leido6) !== String(c6.valor_esperado)) {
+  node.status({
+    fill: "grey",
+    shape: "ring",
+    text: `${c6?.actuador_codigo ?? "?"}: sigue sin confirmar`,
+  });
+  return null;
+}
+
+const estadoReal = String(leido6) === "1" ? "on" : "off";
+
+msg.url = `${API}/iot/actuadores/${c6.actuador_codigo}/estado`;
+msg.method = "POST";
+msg.headers = { "X-API-Key": API_KEY, "Content-Type": "application/json" };
+msg.payload = { estado: estadoReal };
+
+node.status({
+  fill: "green",
+  shape: "dot",
+  text: `${c6.actuador_codigo}: reportado ${estadoReal}`,
 });
 
 return msg;
