@@ -216,6 +216,116 @@ WHERE tipo = 'falla_lazo' AND estado = 'active';
 
 ---
 
+
+## 10. Decisión por lectura de vuelta
+
+### El problema
+
+El `modbus write` puede devolver error (timeout de respuesta, CRC) **aunque
+la bobina sí haya quedado escrita**. OpenPLC tarda en contestar.
+
+Si se decide por el error de la escritura, se marca `fallido` algo que
+funcionó.
+
+### La regla
+
+**La única prueba de que la orden se aplicó es leerla de vuelta.**
+
+| Escritura | Lectura de vuelta | Resultado |
+|---|---|---|
+| OK | coincide | `ejecutado` |
+| **error** | coincide | **`ejecutado` + `respuesta.advertencia`** |
+| OK | no coincide | `fallido` (timeout) |
+
+Cuando hay error de escritura pero la lectura confirma, se guarda:
+
+```json
+{
+  "respuesta": {
+    "advertencia": "escritura reportó error: ECONNRESET — confirmado por lectura de vuelta",
+    "error_escritura": "ECONNRESET",
+    "confirmado_por": "lectura_vuelta"
+  }
+}
+```
+
+**No se oculta.** Quien revise el historial debe saber que hubo un problema
+de comunicación, aunque el equipo quedara bien.
+
+### Response timeout del cliente Modbus
+
+```
+Response timeout      → 5000 ms   (por defecto 1000: demasiado corto)
+Delay between polls   → 1000 ms
+```
+
+Con 1 s, casi todas las escrituras a OpenPLC dan error falso.
+
+### Evitar escrituras duplicadas
+
+El inject consulta cada 2 s. Si el comando sigue `pendiente` mientras se
+escribe, el siguiente ciclo lo vuelve a escribir y **las dos escrituras
+Modbus chocan**.
+
+Por eso se marca `enviado` **antes de escribir**, en el bloque 2:
+
+```js
+await fetch(`${API}/iot/comandos/${cmd.id}`, { method: 'PATCH',
+  body: JSON.stringify({ estado: 'enviado' }) });
+
+// solo entonces: modbus write
+```
+
+Si no se puede marcar, **no se escribe**.
+
+## 11. Reconciliación por estado reportado
+
+### Por qué
+
+Un comando puede quedar `fallido` porque el equipo tardó más que el
+timeout. Si más tarde el actuador reporta el estado pedido, hay que
+corregirlo: el comando funcionó, solo que despacio.
+
+### Cómo
+
+El integrador informa del estado real:
+
+```bash
+POST /api/v1/iot/actuadores/DIGITAL-OUT-FOCO/estado
+{ "estado": "on" }
+```
+
+La API busca comandos recientes `fallido` o `enviado` de ese actuador que
+pidieran **ese** estado y los pasa a `ejecutado`:
+
+```json
+{
+  "estado": "ejecutado",
+  "respuesta": {
+    "confirmado_por": "estado_reportado",
+    "estado_reportado": "on",
+    "advertencia": "escritura reportó error: ECONNRESET",
+    "motivo_original": "timeout"
+  }
+}
+```
+
+### Es una confirmación INDIRECTA
+
+No se leyó la salida justo después de escribir: se deduce del estado que el
+equipo reporta después. Es más débil — el equipo pudo cambiar por otra
+causa entre medias.
+
+**En la tesis debe decirse así**, y por eso queda marcado explícitamente con
+`confirmado_por: "estado_reportado"`, distinto de `"lectura_vuelta"`.
+
+### Qué NO reconcilia
+
+- Un comando ya `ejecutado` (está cerrado).
+- Un comando `pendiente` (aún no se escribió: sería adelantarse).
+- Un estado distinto del pedido.
+- Comandos de hace más de 10 minutos (ventana configurable).
+
 ## 7. Cómo aplicar los cambios
 
 ```bash

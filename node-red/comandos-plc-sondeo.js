@@ -34,6 +34,35 @@
  * Con ellas la consulta SQL del proyecto desglosa dónde se va el tiempo.
  *
  * ──────────────────────────────────────────────────────────────────────
+ * TRES REGLAS QUE NO SE DEBEN ROMPER
+ * ──────────────────────────────────────────────────────────────────────
+ *
+ * 1. SE MARCA `enviado` ANTES DE ESCRIBIR.
+ *
+ *    El inject consulta cada 2 s. Si el comando sigue `pendiente` mientras
+ *    se está escribiendo, el siguiente ciclo lo escribe OTRA VEZ, y las dos
+ *    escrituras Modbus chocan. Marcándolo `enviado` al recogerlo, deja de
+ *    aparecer en `/iot/comandos/pendientes`.
+ *
+ * 2. SE DECIDE POR LA LECTURA, NO POR EL ERROR DE LA ESCRITURA.
+ *
+ *    El `modbus write` puede devolver error (timeout de respuesta, CRC…)
+ *    aunque la bobina SÍ haya quedado escrita: OpenPLC tarda en contestar.
+ *    La única prueba de que la orden se aplicó es leerla de vuelta.
+ *
+ *    Si el valor leído coincide y la escritura había dado error, el comando
+ *    se da por EJECUTADO y el error se guarda en `respuesta.advertencia`.
+ *    No se oculta: quien lea el historial debe saber que hubo un aviso.
+ *
+ * 3. RESPONSE TIMEOUT DEL CLIENTE MODBUS: 3–5 s.
+ *
+ *    En el nodo `modbus write` y en el `modbus read`:
+ *      Response timeout  → 5000 ms
+ *      Delay between polls → 1000 ms
+ *    OpenPLC responde lento; con el valor por defecto (1000 ms) casi todas
+ *    las escrituras dan error aunque funcionen.
+ *
+ * ──────────────────────────────────────────────────────────────────────
  * CONFIGURACIÓN
  * ──────────────────────────────────────────────────────────────────────
  * En la variable de entorno de Node-RED:
@@ -124,6 +153,32 @@ for (const cmd of pendientes) {
   const dir = cmd.direccionamiento || {};
   const config = await configuracionDe(cmd.actuador_codigo);
 
+  /*
+   * ── MARCAR 'enviado' ANTES DE ESCRIBIR ──
+   *
+   * Este inject corre cada 2 s. Si el comando siguiera `pendiente` mientras
+   * se escribe, el siguiente ciclo lo recogería otra vez, lo escribiría de
+   * nuevo, y las dos escrituras Modbus pueden pisarse: la segunda puede
+   * llegar a mitad de la primera y dejar la bobina en un estado indefinido.
+   *
+   * Marcándolo ahora, `/iot/comandos/pendientes` deja de devolverlo y no hay
+   * segunda escritura. El precio es que si Node-RED muere justo aquí, el
+   * comando queda `enviado` sin confirmar; por eso existe la reconciliación
+   * por estado reportado en la API, y por eso el comando expira.
+   */
+  const enviadoEn = new Date().toISOString();
+  try {
+    await fetch(`${API}/iot/comandos/${cmd.id}`, {
+      method: "PATCH",
+      headers: { "X-API-Key": API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ estado: "enviado", enviado_en: enviadoEn }),
+    });
+  } catch (e) {
+    // Si no se puede marcar, NO se escribe: se evita el duplicado.
+    node.warn(`No se pudo marcar 'enviado' ${cmd.id}: ${e.message}`);
+    continue;
+  }
+
   const encender = ["ON", "1", "TRUE", "ENCENDER"].includes(
     String(cmd.comando || "").toUpperCase()
   );
@@ -148,6 +203,13 @@ for (const cmd of pendientes) {
       timeout_s: config.timeout_s,
       latencia_s: config.latencia_s,
       recogido_en: msg.recogido_en,
+      // Ya quedó marcado arriba; aquí solo se propaga al resto del flujo.
+      enviado_en: enviadoEn,
+      /*
+       * Error que reportó la ESCRITURA, si lo hubo. Se rellena en el bloque
+       * 3 y NO decide nada: la decisión es de la lectura de vuelta.
+       */
+      error_escritura: null,
     },
   });
 }
@@ -175,9 +237,29 @@ return [salidas];
 const actual = msg.comando_actual;
 if (!actual) return null;
 
-// Primera vez que pasa por aquí: marcar el envío y arrancar el cronómetro.
-if (!actual.enviado_en) {
-  actual.enviado_en = new Date().toISOString();
+/*
+ * ── CAPTURAR EL ERROR DE ESCRITURA, SIN DECIDIR CON ÉL ──
+ *
+ * El nodo `modbus write` deja el resultado en `msg.payload` o en `msg.error`
+ * según cómo esté configurado. Aquí solo se ANOTA: la decisión la toma la
+ * lectura de vuelta, más abajo.
+ *
+ * OpenPLC tarda en responder; con un Response timeout de 1 s el write da
+ * error aunque la bobina haya quedado escrita. Descartar el comando por ese
+ * error marcaría como fallido algo que sí funcionó.
+ */
+if (msg.error || msg.payload?.error) {
+  actual.error_escritura =
+    String(msg.error || msg.payload?.error?.message || msg.payload?.error);
+  node.warn(
+    `[escritura] ${actual.actuador_codigo}: ${actual.error_escritura} ` +
+    `— se decidirá por lectura de vuelta`
+  );
+}
+
+// Primera vez que pasa por aquí: arrancar el cronómetro.
+// (`enviado_en` ya se fijó ANTES de escribir, en el bloque 2.)
+if (!actual.inicio_ms) {
   actual.inicio_ms = Date.now();
   node.status({
     fill: "blue",
@@ -202,7 +284,10 @@ const limite_ms = actual.timeout_s * 1000;
 if (transcurrido_ms >= limite_ms) {
   node.warn(
     `[timeout] ${actual.actuador_codigo}: se esperaba ${actual.valor_esperado} ` +
-    `y se leyó ${leido} tras ${(transcurrido_ms / 1000).toFixed(1)} s`
+    `y se leyó ${leido} tras ${(transcurrido_ms / 1000).toFixed(1)} s` +
+    (actual.error_escritura
+      ? ` (la escritura había avisado: ${actual.error_escritura})`
+      : "")
   );
   return [null, msg];           // salida 2 → confirmar 'fallido'
 }
@@ -230,8 +315,21 @@ return [msg, null];             // salida 1 → volver a `modbus read`
 
 const c = msg.comando_actual;
 const valorLeido = msg.payload;
-const exito = String(valorLeido) === String(c.valor_esperado);
 const transcurrido = c.inicio_ms ? Date.now() - c.inicio_ms : null;
+
+/*
+ * ── LA DECISIÓN ES DE LA LECTURA, NO DE LA ESCRITURA ──
+ *
+ * `exito` depende SOLO de que el valor leído coincida con el esperado.
+ * El error de la escritura (`c.error_escritura`) NO cambia la decisión:
+ *
+ *   - write con error + lectura correcta  → EJECUTADO, con advertencia
+ *   - write correcto + lectura incorrecta → fallido (timeout)
+ *
+ * OpenPLC tarda en contestar al write; descartar por ese error marcaría
+ * como fallido algo que la bobina ya tiene aplicado.
+ */
+const exito = String(valorLeido) === String(c.valor_esperado);
 
 msg.url = `${API}/iot/comandos/${c.id}`;
 msg.method = "PATCH";
@@ -257,13 +355,32 @@ msg.payload = {
     motivo: exito ? "confirmado" : "timeout",
     timeout_s: c.timeout_s,
     latencia_configurada_s: c.latencia_s,
+
+    /*
+     * ADVERTENCIA: la escritura dio error pero la lectura confirmó.
+     *
+     * Se guarda y se muestra. Ocultarlo dejaría un historial que dice
+     * «ejecutado» sin rastro de que hubo un problema de comunicación, y
+     * quien lo revise no entendería por qué el equipo a veces tarda.
+     */
+    ...(exito && c.error_escritura
+      ? {
+          advertencia:
+            `escritura reportó error: ${c.error_escritura}` +
+            " — confirmado por lectura de vuelta",
+          error_escritura: c.error_escritura,
+          confirmado_por: "lectura_vuelta",
+        }
+      : {}),
   },
 };
 
 node.status({
   fill: exito ? "green" : "red",
   shape: "dot",
-  text: `${c.actuador_codigo}: ${exito ? "ejecutado" : "timeout"}`,
+  text:
+    `${c.actuador_codigo}: ${exito ? "ejecutado" : "timeout"}` +
+    (exito && c.error_escritura ? " (con aviso)" : ""),
 });
 
 return msg;
